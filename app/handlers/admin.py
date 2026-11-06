@@ -110,13 +110,37 @@ async def cb_new_group(call: CallbackQuery, deps: Deps):
     if active:
         await call.answer("Bu guruhda faol o‘yin bor. Avval uni yakunlang yoki bekor qiling.", show_alert=True)
         return
-    stories = await deps.stories.list_stories()
     b = InlineKeyboardBuilder()
-    for s in stories:
-        b.button(text=f"📖 {s['title']}", callback_data=f"ng:s:{chat_id}:{s['id']}")
+    b.button(text="📖 Hikoya bilan", callback_data=f"ng:m:{chat_id}:1")
+    b.button(text="⚡ Hikoyasiz (faqat savollar)", callback_data=f"ng:m:{chat_id}:0")
     b.button(text="⬅️ Orqaga", callback_data="a:new")
     b.adjust(1)
-    await render(call, "📚 Hikoyani tanlang:", b.as_markup())
+    await render(call, "🎬 <b>Hikoya rejimi</b>\n\n"
+                       "• <b>Hikoya bilan</b> — har zinada hikoya matni, rasm/GIF chiqadi, o‘yin hikoya bilan davom etadi.\n"
+                       "• <b>Hikoyasiz</b> — hikoya ko‘rsatilmaydi, faqat zinapoya, savollar va natijalar.",
+                 b.as_markup())
+
+
+@router.callback_query(F.data.startswith("ng:m:"))
+async def cb_new_mode(call: CallbackQuery, deps: Deps):
+    _, _, chat_id, mode = call.data.split(":")
+    chat_id = int(chat_id)
+    if mode == "1":
+        stories = await deps.stories.list_stories()
+        b = InlineKeyboardBuilder()
+        for s in stories:
+            b.button(text=f"📖 {s['title']}", callback_data=f"ng:s:{chat_id}:{s['id']}")
+        b.button(text="⬅️ Orqaga", callback_data=f"ng:g:{chat_id}")
+        b.adjust(1)
+        await render(call, "📚 Hikoyani tanlang:", b.as_markup())
+        return
+    group = await deps.db.fetchrow("SELECT * FROM groups WHERE chat_id=$1", chat_id)
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Ro‘yxat yig‘ishni boshlash", callback_data=f"ng:ok:{chat_id}:0")
+    b.button(text="⬅️ Orqaga", callback_data=f"ng:g:{chat_id}")
+    b.adjust(1)
+    await render(call, f"👥 Guruh: <b>{esc(group['title'])}</b>\n⚡ Rejim: <b>hikoyasiz</b>\n\n"
+                       "Tasdiqlasangiz, guruhga ro‘yxatga yozilish xabari yuboriladi.", b.as_markup())
 
 
 @router.callback_query(F.data.startswith("ng:s:"))
@@ -126,7 +150,7 @@ async def cb_new_story(call: CallbackQuery, deps: Deps):
     group = await deps.db.fetchrow("SELECT * FROM groups WHERE chat_id=$1", int(chat_id))
     b = InlineKeyboardBuilder()
     b.button(text="✅ Ro‘yxat yig‘ishni boshlash", callback_data=f"ng:ok:{chat_id}:{story_id}")
-    b.button(text="⬅️ Orqaga", callback_data=f"ng:g:{chat_id}")
+    b.button(text="⬅️ Orqaga", callback_data=f"ng:m:{chat_id}:1")
     b.adjust(1)
     await render(call, f"👥 Guruh: <b>{esc(group['title'])}</b>\n📖 Hikoya: <b>{esc(story['title'])}</b>\n"
                        f"<i>{esc(story['genre'])}</i>\n\n{esc(story['synopsis'])}\n\n"
@@ -137,7 +161,9 @@ async def cb_new_story(call: CallbackQuery, deps: Deps):
 async def cb_new_ok(call: CallbackQuery, deps: Deps):
     _, _, chat_id, story_id = call.data.split(":")
     try:
-        game_id = await deps.games.create_game(int(chat_id), int(story_id), call.from_user.id)
+        story_mode = int(story_id) != 0  # 0 = hikoyasiz rejim
+        game_id = await deps.games.create_game(int(chat_id), int(story_id) if story_mode else None,
+                                               call.from_user.id, story_mode=story_mode)
     except GameError as exc:
         await call.answer(str(exc), show_alert=True)
         return
@@ -177,7 +203,7 @@ async def show_game(event, deps: Deps, game_id: int) -> None:
     text = [
         f"🎮 <b>O‘yin #{g['id']}</b>",
         f"👥 Guruh: <b>{esc(g['group_title'])}</b>",
-        f"📖 Hikoya: <b>{esc(g['story_title'])}</b>",
+        (f"📖 Hikoya: <b>{esc(g['story_title'])}</b>" if g["story_mode"] else "⚡ Rejim: <b>hikoyasiz</b>"),
         f"Holat: <b>{STATUS_LABEL[g['status']]}</b>",
         f"🪜 {text_ladder(g['current_stage'])}",
         f"👤 Ro‘yxatda: <b>{len(roster)}</b> kishi",
@@ -190,7 +216,8 @@ async def show_game(event, deps: Deps, game_id: int) -> None:
     st = g["status"]
     if st == "lobby":
         b.button(text="▶️ O‘yinni boshlash", callback_data=f"gx:start:{game_id}")
-        b.button(text="🔁 Hikoyani almashtirish", callback_data=f"gx:story:{game_id}")
+        if g["story_mode"]:
+            b.button(text="🔁 Hikoyani almashtirish", callback_data=f"gx:story:{game_id}")
         b.button(text="👥 Ro‘yxat", callback_data=f"gx:roster:{game_id}")
     elif st == "running":
         b.button(text="⏸ Pauza", callback_data=f"gx:pause:{game_id}")
@@ -491,7 +518,10 @@ async def cb_stats(call: CallbackQuery, deps: Deps):
         "count(*) FILTER (WHERE status='cancelled') AS cancelled, "
         "count(*) FILTER (WHERE status IN ('lobby','running','paused')) AS active FROM games")
     ans = await q.fetchrow(
-        "SELECT count(*) AS total, count(*) FILTER (WHERE is_correct) AS correct FROM answers")
+        "SELECT count(*) AS total, count(*) FILTER (WHERE ok) AS correct FROM ("
+        "SELECT COALESCE(is_correct, FALSE) AS ok FROM answers UNION ALL "
+        "SELECT (v.choice_index = gt.correct_option) AS ok FROM votes v "
+        "JOIN game_tasks gt ON gt.id=v.game_task_id) x")
     outcomes = await q.fetchrow(
         "SELECT count(*) FILTER (WHERE outcome='timeout') AS timeout, count(*) FILTER (WHERE outcome IS NOT NULL) AS total "
         "FROM game_tasks")

@@ -12,13 +12,14 @@ from app.deps import Deps
 from app.utils.tg import esc, mention, try_call
 
 log = logging.getLogger(__name__)
+LETTERS = "ABCD"
 router = Router(name="answers")
 GROUP = F.chat.type.in_({"group", "supergroup"})
 
 DENY = {
     "paused": "⏸ O‘yin pauzada. Javob qabul qilinmaydi.",
     "closed": "Bu topshiriq yopilgan.",
-    "already": "Bu topshiriqqa javob allaqachon qabul qilingan.",
+    "already": "Siz bu topshiriqda allaqachon javob/ovoz berdingiz — u bir marta qabul qilinadi.",
     "not_player": ("Siz bu o‘yin ro‘yxatida yo‘qsiz. Ro‘yxat o‘yin boshlanganda yopilgan — "
                    "keyingi o‘yinda qatnashasiz. (Botga /start bosib, ro‘yxatga yozilishni unutmang.)"),
     "not_yours": "Bu topshiriq sizga berilmagan.",
@@ -36,8 +37,13 @@ async def on_choice(call: CallbackQuery, deps: Deps):
         await call.answer()
         return
     res = await deps.games.submit_choice(gt_id, call.from_user.id, idx)
+    if res.status == "voted":  # guruh testi: ovoz qabul qilindi, natija ovoz berish yopilganda e’lon qilinadi
+        await call.answer(f"🗳 Ovozingiz qabul qilindi: {LETTERS[res.choice]}", show_alert=False)
+        return
     if res.status in ("ok", "timeout"):
-        await call.answer("✅ Javob qabul qilindi!" if res.status == "ok" else "⏰ Vaqt tugagan edi.")
+        is_vote = bool(res.task and res.task.get("kind") == "test")
+        await call.answer(("🗳 Ovozingiz qabul qilindi!" if is_vote else "✅ Javob qabul qilindi!")
+                          if res.status == "ok" else "⏰ Vaqt tugagan edi.")
         # individual topshiriq bo‘lsa, shaxsiy chatdagi tugmalarni olib tashlaymiz
         if call.message and call.message.chat.type == "private":
             await try_call(call.message.edit_reply_markup, reply_markup=None)
