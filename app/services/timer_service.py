@@ -77,7 +77,13 @@ class TimerService:
         # 5) lobbi xabarini yangilash
         for game_id in await self.games.dirty_lobby_ids():
             await self.flow.refresh_lobby(game_id)
-        # 6) Render uxlab qolmasligi uchun faol o‘yin paytida o‘zini “uyg‘otish”
+        # 6) ovozli testlarda «ovoz berganlar» sonini yangilash
+        for gt_id in await self.games.dirty_vote_task_ids():
+            try:
+                await self.flow.refresh_vote_message(gt_id)
+            except Exception:
+                log.exception("Ovoz xabarini yangilashda xato (%s)", gt_id)
+        # 7) Render uxlab qolmasligi uchun faol o‘yin paytida o‘zini “uyg‘otish”
         await self._keepalive()
 
     async def _keepalive(self) -> None:

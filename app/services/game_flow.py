@@ -44,10 +44,13 @@ class GameFlow:
         game = await self.games.get_game(game_id)
         story = await self.stories.get_story(game["story_id"])
         roster = await self.games.roster(game_id)
+        if game["story_mode"]:
+            story_lines = [f"📖 Hikoya: <b>{esc(story['title'])}</b>", f"<i>{esc(story['synopsis'])}</i>"]
+        else:
+            story_lines = ["⚡ Rejim: <b>hikoyasiz</b> — faqat savollar va zinapoya."]
         lines = [
             "🧭 <b>SIRLI SAFAR</b> — sarguzasht boshlanmoqda!",
-            f"📖 Hikoya: <b>{esc(story['title'])}</b>",
-            f"<i>{esc(story['synopsis'])}</i>",
+            *story_lines,
             "",
             "Guruhdagi barcha ishtirokchilar bitta jamoa. Maqsad — <b>1-zinadan 10-zinaga</b> yetib borish: "
             "to‘g‘ri javob — bir zina yuqoriga, noto‘g‘ri javob yoki vaqt tugashi — bir zina pastga.",
@@ -94,10 +97,12 @@ class GameFlow:
         roster = await self.games.roster(game_id)
         await try_call(
             self.bot.send_message, game["group_id"],
-            f"🚀 <b>SIRLI SAFAR boshlandi!</b>\n📖 «{esc(story['title'])}»\n"
-            f"👥 Jamoa a’zolari: <b>{len(roster)}</b> kishi\n\n"
+            f"🚀 <b>SIRLI SAFAR boshlandi!</b>\n"
+            + (f"📖 «{esc(story['title'])}»\n" if game["story_mode"] else "")
+            + f"👥 Jamoa a’zolari: <b>{len(roster)}</b> kishi\n\n"
             "• To‘g‘ri javob — <b>+1 zina</b>, noto‘g‘ri javob yoki vaqt tugashi — <b>−1 zina</b>.\n"
-            "• Variantli testda jamoadan <b>birinchi bosilgan</b> javob yakuniy hisoblanadi.\n"
+            "• Variantli testda jamoa <b>ovoz beradi</b>: har kim bitta ovoz, <b>eng ko‘p ovoz olgan variant</b> "
+            "yakuniy javob. Ovozlar teng bo‘lsa — noto‘g‘ri hisoblanadi.\n"
             "• Matnli topshiriqda topshiriq xabariga <b>reply</b> qilib yozing — birinchi javob yakuniy.\n"
             "• Individual topshiriq tanlangan talabaga shaxsiy chatda yuboriladi.\n\n"
             "Omad! Jamoa — birdamlikda kuch! 💪")
@@ -109,14 +114,17 @@ class GameFlow:
     async def send_stair(self, game, stage_no: int) -> None:
         stage = await self.stories.get_stage(game["story_id"], stage_no)
         story = await self.stories.get_story(game["story_id"])
+        with_story = bool(game["story_mode"])
         png = await asyncio.to_thread(
-            render_staircase, stage_no, story_title=story["title"],
-            stage_title=stage["title"] if stage else "", theme=story["theme"])
+            render_staircase, stage_no, story_title=story["title"] if with_story else "",
+            stage_title=(stage["title"] if stage else "") if with_story else "", theme=story["theme"])
         await try_call(
             self.bot.send_photo, game["group_id"], BufferedInputFile(png, filename=f"zina_{stage_no}.png"),
             caption=f"🪜 {text_ladder(stage_no)}\n<b>{stage_no}-zina</b>")
 
     async def send_story_part(self, game, stage_no: int, up: bool) -> None:
+        if not game["story_mode"]:  # hikoyasiz rejim: hikoya matni, rasm va GIF yuborilmaydi
+            return
         stage = await self.stories.get_stage(game["story_id"], stage_no)
         if not stage:
             return
@@ -195,11 +203,35 @@ class GameFlow:
         lines.append(f"⏱ Vaqt: <b>{fmt_limit(gt['time_limit_sec'])}</b>")
         return "\n".join(lines)
 
+    async def _vote_footer(self, gt: dict) -> str:
+        voted, total = await self.games.vote_progress(gt["id"])
+        return ("\n\n🗳 <b>Jamoa ovoz beradi!</b> Har kim <b>bitta</b> ovoz beradi (o‘zgartirib bo‘lmaydi). "
+                "<b>Eng ko‘p ovoz olgan variant</b> yakuniy javob; ovozlar teng bo‘lsa — noto‘g‘ri hisoblanadi.\n"
+                f"👥 Ovoz berganlar: <b>{voted}/{total}</b>")
+
+    async def refresh_vote_message(self, gt_id: int) -> None:
+        """Guruhdagi test xabarida «ovoz berganlar» sonini yangilaydi (taymer orqali, Telegram limitidan oshmasligi uchun)."""
+        if not await self.games.claim_vote_refresh(gt_id):
+            return
+        gt = await self.games.get_task(gt_id)
+        if not gt or gt["status"] != "open" or not gt["group_message_id"]:
+            return
+        text = self._task_text(gt) + await self._vote_footer(gt)
+        try:
+            await tg_call(self.bot.edit_message_text, text, chat_id=gt["group_id"],
+                          message_id=gt["group_message_id"],
+                          reply_markup=kb.answer_kb(gt["id"], len(gt["options"])))
+        except TelegramBadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                log.warning("Ovoz xabarini yangilab bo‘lmadi: %s", exc)
+        except TelegramAPIError as exc:
+            log.warning("Ovoz xabarini yangilab bo‘lmadi: %s", exc)
+
     async def _announce_group_task(self, game, gt: dict) -> None:
         text = self._task_text(gt)
         markup = None
         if gt["kind"] == "test":
-            text += "\n\n👇 Javobni tanlang. Jamoadan <b>birinchi bosilgan</b> javob yakuniy hisoblanadi."
+            text += await self._vote_footer(gt)
             markup = kb.answer_kb(gt["id"], len(gt["options"]))
         elif gt["kind"] == "trap":
             text += ("\n\n✍️ Javobingizni shu xabarga <b>reply</b> qilib yozing yoki topshiriqni bajaring — "
@@ -320,6 +352,8 @@ class GameFlow:
                 return f"🛡 <b>Tuzoqdan omon o‘tdingiz!</b> Jamoa birdamlik bilan sinovdan o‘tdi.\n{res.new_stage}-zinada qolasiz."
             head = "⏰ <b>Tuzoq vaqti tugadi!</b>" if res.outcome == "timeout" else "💥 <b>Tuzoq ishladi!</b>"
             return f"{head}\n{self._move_line(res)}"
+        if res.tally is not None:
+            return await self._vote_result_text(res, gt)
         if res.outcome == "correct":
             return f"✅ <b>To‘g‘ri!</b>\n{who}{self._move_line(res)}"
         if res.outcome == "timeout":
@@ -329,6 +363,22 @@ class GameFlow:
                 and await self.settings.get_bool("reveal_correct")):
             reveal = f"To‘g‘ri javob: <b>{LETTERS[gt['correct_option']]}) {esc(gt['options'][gt['correct_option']])}</b>\n"
         return f"❌ <b>Noto‘g‘ri.</b>\n{who}{reveal}{self._move_line(res)}"
+
+    async def _vote_result_text(self, res: Resolution, gt: dict) -> str:
+        total = sum(res.tally)
+        votes = "🗳 Ovozlar: " + " · ".join(f"<b>{LETTERS[i]}</b> — {n}" for i, n in enumerate(res.tally)) \
+                + f" (jami {total})\n"
+        if res.outcome == "correct":
+            pick = f"{LETTERS[res.chosen]}) {esc(gt['options'][res.chosen])}"
+            return f"✅ <b>To‘g‘ri!</b> Jamoa tanlovi: <b>{pick}</b>\n{votes}{self._move_line(res)}"
+        reveal = ""
+        if (gt.get("correct_option") is not None and await self.settings.get_bool("reveal_correct")):
+            reveal = f"To‘g‘ri javob: <b>{LETTERS[gt['correct_option']]}) {esc(gt['options'][gt['correct_option']])}</b>\n"
+        if res.tie:
+            return ("⚖️ <b>Ovozlar teng bo‘ldi!</b> Jamoa kelisha olmadi — javob noto‘g‘ri hisoblanadi.\n"
+                    f"{votes}{reveal}{self._move_line(res)}")
+        pick = f"{LETTERS[res.chosen]}) {esc(gt['options'][res.chosen])}"
+        return f"❌ <b>Noto‘g‘ri.</b> Jamoa tanlovi: <b>{pick}</b>\n{votes}{reveal}{self._move_line(res)}"
 
     @staticmethod
     def _move_line(res: Resolution) -> str:
@@ -343,7 +393,7 @@ class GameFlow:
     # =============================================================== yakunlash
     async def _finish(self, game, res: Resolution, result_text: str) -> None:
         chat = game["group_id"]
-        stage = await self.stories.get_stage(game["story_id"], 10)
+        stage = await self.stories.get_stage(game["story_id"], 10) if game["story_mode"] else None
         await self._send_gif(chat, "victory", "🏆 <b>G‘ALABA!</b> Jamoa 10-zinaga yetdi!\n" + result_text)
         await self.send_stair(game, 10)
         if stage:

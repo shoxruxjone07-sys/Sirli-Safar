@@ -36,6 +36,9 @@ class Resolution:
     new_stage: int
     finished: bool
     trap_cleared: bool = False
+    tally: Optional[list] = None   # ovozli test: har bir variant uchun ovozlar soni
+    tie: bool = False              # ovozlar teng bo‘ldi
+    chosen: Optional[int] = None   # jamoa tanlagan variant (teng bo‘lsa None)
 
     @property
     def moved(self) -> str:
@@ -48,7 +51,7 @@ class Resolution:
 
 @dataclass
 class AnswerResult:
-    status: str  # ok | already | closed | paused | not_player | not_yours | timeout | wrong_kind | missing
+    status: str  # ok | voted | already | closed | paused | not_player | not_yours | timeout | wrong_kind | missing
     resolution: Optional[Resolution] = None
     task: Optional[dict] = None
     user: Optional[dict] = None
@@ -70,45 +73,52 @@ class GameService:
         self.settings = settings
 
     # ------------------------------------------------------------------ lobbi
-    async def create_game(self, group_id: int, story_id: int, admin_id: int) -> int:
+    async def create_game(self, group_id: int, story_id: Optional[int], admin_id: int,
+                          story_mode: bool = True) -> int:
+        """story_mode=False: o‘yin hikoyasiz o‘tadi (hikoya matnlari, rasm/GIF ko‘rsatilmaydi).
+        Bunda ham ichki sozlama (tuzoq zinasi) uchun birinchi faol hikoya yozib qo‘yiladi."""
         async with self.db.tx() as conn:
             group = await conn.fetchrow("SELECT * FROM groups WHERE chat_id=$1", group_id)
             if not group or not group["is_member"]:
                 raise GameError("Bot bu guruhda emas. Avval botni guruhga qo‘shing.")
-            story = await conn.fetchrow("SELECT id FROM stories WHERE id=$1 AND is_active", story_id)
+            if story_mode:
+                story = await conn.fetchrow("SELECT id FROM stories WHERE id=$1 AND is_active", story_id)
+            else:
+                story = await conn.fetchrow("SELECT id FROM stories WHERE is_active ORDER BY id LIMIT 1")
             if not story:
                 raise GameError("Hikoya topilmadi")
+            story_id = story["id"]
             try:
                 async with conn.transaction():
                     game_id = await conn.fetchval(
-                        "INSERT INTO games(group_id, story_id, admin_id) VALUES($1,$2,$3) RETURNING id",
-                        group_id, story_id, admin_id)
+                        "INSERT INTO games(group_id, story_id, admin_id, story_mode) VALUES($1,$2,$3,$4) RETURNING id",
+                        group_id, story_id, admin_id, story_mode)
             except asyncpg.UniqueViolationError as exc:
                 raise GameError("Bu guruhda allaqachon faol o‘yin bor. Avval uni yakunlang yoki bekor qiling.") from exc
-            await self._event(conn, game_id, "game_created", {"admin": admin_id, "story": story_id})
+            await self._event(conn, game_id, "game_created", {"admin": admin_id, "story": story_id, "story_mode": story_mode})
         return game_id
 
     async def get_game(self, game_id: int) -> Optional[asyncpg.Record]:
         return await self.db.fetchrow(
-            "SELECT g.*, gr.title AS group_title, s.title AS story_title, s.theme AS story_theme "
+            "SELECT g.*, gr.title AS group_title, CASE WHEN g.story_mode THEN s.title ELSE 'Hikoyasiz rejim' END AS story_title, s.theme AS story_theme "
             "FROM games g JOIN groups gr ON gr.chat_id=g.group_id JOIN stories s ON s.id=g.story_id WHERE g.id=$1",
             game_id)
 
     async def active_game_for_group(self, group_id: int) -> Optional[asyncpg.Record]:
         return await self.db.fetchrow(
-            "SELECT g.*, gr.title AS group_title, s.title AS story_title, s.theme AS story_theme "
+            "SELECT g.*, gr.title AS group_title, CASE WHEN g.story_mode THEN s.title ELSE 'Hikoyasiz rejim' END AS story_title, s.theme AS story_theme "
             "FROM games g JOIN groups gr ON gr.chat_id=g.group_id JOIN stories s ON s.id=g.story_id "
             "WHERE g.group_id=$1 AND g.status = ANY($2::text[])", group_id, ACTIVE_GAME_STATUSES)
 
     async def list_active_games(self) -> list[asyncpg.Record]:
         return await self.db.fetch(
-            "SELECT g.*, gr.title AS group_title, s.title AS story_title FROM games g "
+            "SELECT g.*, gr.title AS group_title, CASE WHEN g.story_mode THEN s.title ELSE 'Hikoyasiz rejim' END AS story_title FROM games g "
             "JOIN groups gr ON gr.chat_id=g.group_id JOIN stories s ON s.id=g.story_id "
             "WHERE g.status = ANY($1::text[]) ORDER BY g.id DESC", ACTIVE_GAME_STATUSES)
 
     async def list_finished_games(self, limit: int = 10) -> list[asyncpg.Record]:
         return await self.db.fetch(
-            "SELECT g.*, gr.title AS group_title, s.title AS story_title FROM games g "
+            "SELECT g.*, gr.title AS group_title, CASE WHEN g.story_mode THEN s.title ELSE 'Hikoyasiz rejim' END AS story_title FROM games g "
             "JOIN groups gr ON gr.chat_id=g.group_id JOIN stories s ON s.id=g.story_id "
             "WHERE g.status IN ('finished','cancelled') ORDER BY g.id DESC LIMIT $1", limit)
 
@@ -141,6 +151,8 @@ class GameService:
         async with self.db.game_tx(game_id) as (conn, game):
             if not game or game["status"] != "lobby":
                 raise GameError("Hikoyani faqat o‘yin boshlanishidan oldin almashtirish mumkin")
+            if not game["story_mode"]:
+                raise GameError("Bu o‘yin hikoyasiz rejimda — hikoya tanlanmaydi")
             if not await conn.fetchval("SELECT 1 FROM stories WHERE id=$1 AND is_active", story_id):
                 raise GameError("Hikoya topilmadi")
             await conn.execute("UPDATE games SET story_id=$2, lobby_dirty=TRUE WHERE id=$1", game_id, story_id)
@@ -160,7 +172,7 @@ class GameService:
         if missing:
             problems.append("Quyidagi zinalar uchun topshiriq yo‘q: " + ", ".join(f"{n}-zina" for n in missing))
         stages = await self.db.fetchval("SELECT count(*) FROM story_stages WHERE story_id=$1", game["story_id"])
-        if stages != FINAL_STAGE:
+        if game["story_mode"] and stages != FINAL_STAGE:
             problems.append("Hikoya 10 ta bosqichdan iborat emas")
         return problems
 
@@ -348,6 +360,11 @@ class GameService:
 
     # ----------------------------------------------------------------- javoblar
     async def submit_choice(self, gt_id: int, user_id: int, idx: int) -> AnswerResult:
+        """Variant tanlash.
+        * Guruh testi (`test`): har bir o‘yinchi BITTA ovoz beradi; eng ko‘p ovoz olgan variant jamoa javobi bo‘ladi.
+          Hamma ro‘yxatdagi o‘yinchi ovoz bersa yoki vaqt tugasa ovoz berish yopiladi. Ovozlar teng bo‘lsa — noto‘g‘ri.
+        * Individual variantli topshiriq: tanlangan talabaning javobi darhol hal qiladi.
+        """
         row = await self.db.fetchrow("SELECT game_id FROM game_tasks WHERE id=$1", gt_id)
         if not row:
             return AnswerResult("missing")
@@ -364,11 +381,17 @@ class GameService:
             denied = await self._who_can_answer(conn, game, gt, user_id)
             if denied:
                 return AnswerResult(denied)
+            is_vote = gt["kind"] == "test"
             if await conn.fetchval("SELECT now() >= $1::timestamptz", gt["deadline_at"]):
-                res = await self._resolve(conn, game, gt, "timeout", None)
+                if is_vote:
+                    res = await self._close_vote(conn, game, gt)
+                else:
+                    res = await self._resolve(conn, game, gt, "timeout", None)
                 return AnswerResult("timeout", res, dict(gt))
             if not 0 <= idx < len(gt["options"]):
                 return AnswerResult("wrong_kind")
+            if is_vote:
+                return await self._cast_vote(conn, game, gt, user_id, idx)
             inserted = await conn.fetchval(
                 "INSERT INTO answers(game_task_id,user_id,choice_index,is_correct) VALUES($1,$2,$3,$4) "
                 "ON CONFLICT (game_task_id) DO NOTHING RETURNING id",
@@ -378,6 +401,53 @@ class GameService:
             outcome = "correct" if idx == gt["correct_option"] else "wrong"
             res = await self._resolve(conn, game, gt, outcome, None)
             return AnswerResult("ok", res, dict(gt), choice=idx, user={"tg_id": user_id})
+
+    async def _cast_vote(self, conn, game, gt, user_id: int, idx: int) -> AnswerResult:
+        inserted = await conn.fetchval(
+            "INSERT INTO votes(game_task_id,user_id,choice_index) VALUES($1,$2,$3) "
+            "ON CONFLICT (game_task_id,user_id) DO NOTHING RETURNING 1", gt["id"], user_id, idx)
+        if not inserted:
+            return AnswerResult("already")
+        await conn.execute("UPDATE game_tasks SET vote_dirty=TRUE WHERE id=$1", gt["id"])
+        voted = await conn.fetchval("SELECT count(*) FROM votes WHERE game_task_id=$1", gt["id"])
+        total = await conn.fetchval("SELECT count(*) FROM game_players WHERE game_id=$1", game["id"])
+        if voted >= total:  # hamma ovoz berdi — kutish shart emas
+            res = await self._close_vote(conn, game, gt)
+            return AnswerResult("ok", res, dict(gt), choice=idx, user={"tg_id": user_id})
+        return AnswerResult("voted", None, dict(gt), choice=idx, user={"tg_id": user_id})
+
+    async def _close_vote(self, conn, game, gt) -> Resolution:
+        """Ovozlarni sanab natijani belgilaydi: ko‘pchilik varianti; teng bo‘lsa noto‘g‘ri; ovoz yo‘q — vaqt tugadi."""
+        counts = {r["choice_index"]: r["n"] for r in await conn.fetch(
+            "SELECT choice_index, count(*) AS n FROM votes WHERE game_task_id=$1 GROUP BY choice_index", gt["id"])}
+        if not counts:
+            return await self._resolve(conn, game, gt, "timeout", None)
+        tally = [int(counts.get(i, 0)) for i in range(len(gt["options"]))]
+        top = max(tally)
+        winners = [i for i, n in enumerate(tally) if n == top]
+        tie = len(winners) > 1
+        chosen = None if tie else winners[0]
+        outcome = "correct" if (not tie and chosen == gt["correct_option"]) else "wrong"
+        return await self._resolve(conn, game, gt, outcome, None, tally=tally, tie=tie, chosen=chosen)
+
+    async def vote_progress(self, gt_id: int) -> tuple[int, int]:
+        """(ovoz berganlar, ro‘yxatdagi o‘yinchilar soni)"""
+        row = await self.db.fetchrow(
+            "SELECT (SELECT count(*) FROM votes WHERE game_task_id=gt.id) AS voted, "
+            "(SELECT count(*) FROM game_players WHERE game_id=gt.game_id) AS total "
+            "FROM game_tasks gt WHERE gt.id=$1", gt_id)
+        return (int(row["voted"]), int(row["total"])) if row else (0, 0)
+
+    async def dirty_vote_task_ids(self) -> list[int]:
+        rows = await self.db.fetch(
+            "SELECT gt.id FROM game_tasks gt JOIN games g ON g.id=gt.game_id "
+            "WHERE gt.status='open' AND gt.kind='test' AND gt.vote_dirty AND g.status='running' "
+            "AND gt.group_message_id IS NOT NULL")
+        return [r["id"] for r in rows]
+
+    async def claim_vote_refresh(self, gt_id: int) -> bool:
+        return bool(await self.db.fetchval(
+            "UPDATE game_tasks SET vote_dirty=FALSE WHERE id=$1 AND vote_dirty AND status='open' RETURNING id", gt_id))
 
     async def submit_text(self, gt_id: int, user_id: int, text: str) -> AnswerResult:
         text = (text or "").strip()
@@ -463,6 +533,8 @@ class GameService:
                 return None
             if not await conn.fetchval("SELECT now() >= $1::timestamptz", gt["deadline_at"]):
                 return None
+            if gt["kind"] == "test":
+                return await self._close_vote(conn, game, gt)
             return await self._resolve(conn, game, gt, "timeout", None)
 
     async def _who_can_answer(self, conn, game, gt, user_id: int) -> Optional[str]:
@@ -473,7 +545,8 @@ class GameService:
         return None if in_roster else "not_player"
 
     # --------------------------------------------------------------- natijani qo‘llash
-    async def _resolve(self, conn, game, gt, outcome: str, graded_by: Optional[int]) -> Resolution:
+    async def _resolve(self, conn, game, gt, outcome: str, graded_by: Optional[int], *,
+                       tally: Optional[list] = None, tie: bool = False, chosen: Optional[int] = None) -> Resolution:
         old = game["current_stage"]
         trap_cleared = False
         if gt["kind"] == "trap" and outcome == "correct":
@@ -496,10 +569,12 @@ class GameService:
                 "cleared_traps = CASE WHEN $3 THEN array_append(cleared_traps,$4) ELSE cleared_traps END WHERE id=$1",
                 game["id"], new, trap_cleared, old)
         await self._event(conn, game["id"], "task_resolved",
-                          {"game_task": gt["id"], "outcome": outcome, "from": old, "to": new, "by": graded_by})
+                          {"game_task": gt["id"], "outcome": outcome, "from": old, "to": new, "by": graded_by,
+                           **({"votes": tally, "tie": tie, "chosen": chosen} if tally is not None else {})})
         if finished:
             await self._store_results(conn, game["id"])
-        return Resolution(game["id"], game["group_id"], dict(gt), outcome, old, new, finished, trap_cleared)
+        return Resolution(game["id"], game["group_id"], dict(gt), outcome, old, new, finished, trap_cleared,
+                          tally=tally, tie=tie, chosen=chosen)
 
     async def stats(self, game_id: int, conn=None) -> dict:
         c = conn or self.db.pool
@@ -512,10 +587,15 @@ class GameService:
             "FROM game_tasks WHERE game_id=$1", game_id)
         game = await c.fetchrow("SELECT * FROM games WHERE id=$1", game_id)
         top = await c.fetch(
+            "WITH per AS ("
+            " SELECT a.user_id, COALESCE(a.is_correct, FALSE) AS ok FROM answers a "
+            "  JOIN game_tasks gt ON gt.id=a.game_task_id WHERE gt.game_id=$1"
+            " UNION ALL"
+            " SELECT v.user_id, (v.choice_index = gt.correct_option) AS ok FROM votes v "
+            "  JOIN game_tasks gt ON gt.id=v.game_task_id WHERE gt.game_id=$1 AND gt.status='resolved') "
             "SELECT p.tg_id, p.username, p.full_name, count(*) AS answered, "
-            "count(*) FILTER (WHERE a.is_correct) AS correct FROM answers a "
-            "JOIN game_tasks gt ON gt.id=a.game_task_id JOIN players p ON p.tg_id=a.user_id "
-            "WHERE gt.game_id=$1 GROUP BY p.tg_id ORDER BY correct DESC, answered DESC, p.full_name LIMIT 5", game_id)
+            "count(*) FILTER (WHERE per.ok) AS correct FROM per JOIN players p ON p.tg_id=per.user_id "
+            "GROUP BY p.tg_id ORDER BY correct DESC, answered DESC, p.full_name LIMIT 5", game_id)
         duration = 0
         if game and game["started_at"]:
             secs = await c.fetchval(
